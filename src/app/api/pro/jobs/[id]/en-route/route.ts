@@ -1,0 +1,29 @@
+import { proApiError, proApiOk } from "@/lib/server/pro-api-response";
+import { isSameOrigin, requireProfessionalSession } from "@/lib/server/pro-auth";
+import { checkRateLimit, clientIp } from "@/lib/server/rate-limit";
+import { performProfessionalFieldTransition } from "@/lib/server/pro-field-transition";
+
+export async function POST(request: Request, { params }: { params: Promise<{ id: string }> }) {
+  if (!isSameOrigin(request)) return proApiError("FORBIDDEN", "Invalid request origin.");
+
+  const professional = await requireProfessionalSession();
+  if (!professional) return proApiError("UNAUTHORIZED", "Sign in required.");
+
+  const rl = checkRateLimit("professional-mutation", clientIp(request), { windowMs: 60_000, max: 60 });
+  if (!rl.allowed) return proApiError("RATE_LIMITED", "Too many requests. Please slow down.");
+
+  const { id } = await params;
+  const result = await performProfessionalFieldTransition({
+    jobId: id,
+    professionalId: professional.id,
+    to: "EN_ROUTE",
+    auditAction: "JOB_EN_ROUTE",
+  });
+
+  if (!result.ok) {
+    return result.code === "NOT_FOUND"
+      ? proApiError("NOT_FOUND", "Job not found.")
+      : proApiError("CONFLICT", "This job isn't ready for that action right now.");
+  }
+  return proApiOk({ id, status: "EN_ROUTE" });
+}

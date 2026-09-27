@@ -1,0 +1,51 @@
+@import "tailwindcss";
+
+/*
+ * Servino brand tokens.
+ * Do not use raw hex values in components — reference these utilities
+ * (bg-purple, text-ink, border-border, etc.) or src/lib/design-tokens.ts.
+ * Distribution target: ~70% neutrals (offwhite/ink/border), ~20% purple,
+ * ~10% coral/teal accents.
+ */
+:root {
+  --color-purple: #5b4cf0;
+  --color-purple-dark: #4636c9;
+  --color-purple-light: #edebfe;
+  --color-coral: #ff6b57;
+  --color-coral-light: #ffe4e0;
+  /* Darker variant for coral TEXT specifically (chips, negative amounts) —
+     --color-coral itself is ~2.8:1 on white/coral-light, below WCAG AA's
+     4.5:1 for normal text. Keep --color-coral for backgrounds/borders/fills
+     where it was already in use; use this one wherever coral is the
+     foreground color of text that must pass contrast. */
+  --color-coral-text: #a8301f;
+  --color-teal: #16a085;
+  --color-teal-light: #dff5f0;
+  --color-offwhite: #faf9f6;
+  --color-ink: #161722;
+  --color-ink-muted: #5b5c6b;
+  --color-border: #e7e5e0;
+}
+
+@theme inline {
+  --color-purple: var(--color-purple);
+  --color-purple-dark: var(--color-purple-dark);
+  --color-purple-light: var(--color-purple-light);
+  --color-coral: var(--color-coral);
+  --color-coral-light: var(--color-coral-light);
+  --color-coral-text: var(--color-coral-text);
+  --color-teal: var(--color-teal);
+  --color-teal-light: var(--color-teal-light);
+  --color-offwhite: var(--color-offwhite);
+  --color-ink: var(--color-ink);
+  --color-ink-muted: var(--color-ink-muted);
+  --color-border: var(--color-border);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--color-offwhite);
+  color: var(--color-ink);
+  font-family: var(--font-sans), Arial, Helvetica, sans-serif;
+}

@@ -1,0 +1,11 @@
+-- Database-level guarantee that at most one non-failed Refund row can
+-- exist per Payment at a time (same pattern as D027's
+-- PricingVersion_one_active_per_city and D035's JobOffer_one_open_per_job
+-- partial unique indexes) — this is what actually makes two concurrent
+-- refund requests for the same payment safe. Application-level checks
+-- alone raced: both requests could read Payment.status = CAPTURED before
+-- either committed, both then created a Refund row and called the
+-- provider, and only the LATER Payment.status conditional update was
+-- guarded — nothing stopped both Refund rows from independently being
+-- marked COMPLETED. Caught by tests/e2e/financial-concurrency.spec.ts.
+CREATE UNIQUE INDEX "Refund_one_active_per_payment" ON "Refund"("paymentId") WHERE "status" IN ('PENDING', 'COMPLETED');

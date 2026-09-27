@@ -1,0 +1,1164 @@
+// Servino — database schema.
+//
+// Phase A: taxonomy needed to back the homepage (service categories,
+// services, and the location hierarchy they're offered in).
+//
+// Phase B2 adds durable lead capture: Lead, LeadAttribution, ContactInfo,
+// TimingSelection, ConsentEvidence, QuoteSnapshot, BookingIntent. This is
+// deliberately NOT the full future marketplace schema (spec section 69) —
+// no professionals, payments, matching, messaging, disputes, etc. yet.
+// Those arrive in their respective phases (F, G, H, I).
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum PublicPricingMode {
+  EXACT_PRICE
+  STARTING_FROM
+  RANGE
+  QUOTE_ONLY
+  NO_PUBLIC_PRICE
+}
+
+model Country {
+  id        String     @id @default(cuid())
+  code      String     @unique // ISO 3166-1 alpha-2, e.g. "CA"
+  name      String
+  provinces Province[]
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+}
+
+model Province {
+  id        String   @id @default(cuid())
+  code      String // e.g. "ON"
+  name      String
+  country   Country  @relation(fields: [countryId], references: [id])
+  countryId String
+  cities    City[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([countryId, code])
+}
+
+model City {
+  id         String        @id @default(cuid())
+  slug       String        @unique // e.g. "toronto"
+  name       String
+  province   Province      @relation(fields: [provinceId], references: [id])
+  provinceId String
+  enabled    Boolean       @default(false)
+  services   ServiceCity[]
+  createdAt  DateTime      @default(now())
+  updatedAt  DateTime      @updatedAt
+}
+
+model ServiceCategory {
+  id        String    @id @default(cuid())
+  slug      String    @unique
+  name      String
+  services  Service[]
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+}
+
+model Service {
+  id                String            @id @default(cuid())
+  slug              String            @unique
+  name              String
+  shortDescription  String
+  category          ServiceCategory   @relation(fields: [categoryId], references: [id])
+  categoryId        String
+  publicPricingMode PublicPricingMode @default(QUOTE_ONLY)
+  enabled           Boolean           @default(false)
+  cities            ServiceCity[]
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+}
+
+// Join table: which cities a given service is currently offered in.
+model ServiceCity {
+  id        String   @id @default(cuid())
+  service   Service  @relation(fields: [serviceId], references: [id])
+  serviceId String
+  city      City     @relation(fields: [cityId], references: [id])
+  cityId    String
+  enabled   Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  @@unique([serviceId, cityId])
+}
+
+// =============================================================================
+// Phase B2 — durable lead capture
+// =============================================================================
+
+enum LeadStatus {
+  QUOTE_STARTED
+  QUOTE_PARTIAL
+  PRICE_VIEWED
+  CONTACT_CAPTURED
+  BOOKING_INTENT
+  // ABANDONED is a documented future state (spec section 8) — nothing in
+  // B2 marks leads abandoned yet; that needs a scheduled job, out of scope.
+}
+
+enum LeadFunnelStep {
+  PROJECT
+  MEASUREMENTS
+  PHOTO
+  STYLE
+  PRICE
+  CONTACT
+  TIMING
+  PAYMENT
+  CONFIRMATION
+}
+
+enum MeasurementUnit {
+  METRIC
+  IMPERIAL
+}
+
+enum MaterialOwnership {
+  INSTALL_ONLY
+  MATERIAL_AND_INSTALL
+}
+
+enum TimingValue {
+  ASAP
+  WITHIN_2_WEEKS
+  WITHIN_MONTH
+  JUST_PLANNING
+}
+
+// Session E adds AUTHORITATIVE_VERSIONED once a real PricingVersion is
+// configured and active — MOCK_DEV remains for dev/test convenience when
+// no active version exists yet (never selectable in production — see
+// docs/DECISIONS.md D026).
+enum PricingSourceType {
+  MOCK_DEV
+  AUTHORITATIVE_VERSIONED
+}
+
+enum ConsentCategory {
+  ESSENTIAL
+  ANALYTICS
+  MARKETING
+}
+
+enum ConsentChannel {
+  SYSTEM
+  EMAIL
+  SMS
+  PHONE
+}
+
+// The durable record of a quote-funnel visitor. Created as soon as a
+// session starts an actual quote (spec section 8/13); the anonymous
+// browser session ID is the join key back to the frontend's QuoteState.
+model Lead {
+  id        String     @id @default(cuid())
+  sessionId String     @unique
+  status    LeadStatus @default(QUOTE_STARTED)
+
+  serviceSlug String?
+  postalCode  String?
+  citySlug    String?
+
+  measurementUnit MeasurementUnit?
+  // Stored with fixed precision — never a float — see docs/SECURITY_MODEL.md.
+  totalAreaM2     Decimal?         @db.Decimal(6, 2)
+
+  styleId           String?
+  materialOwnership MaterialOwnership?
+
+  currentStep LeadFunnelStep @default(PROJECT)
+
+  attribution    LeadAttribution?
+  contact        ContactInfo?
+  timing         TimingSelection?
+  consents       ConsentEvidence[]
+  quoteSnapshots QuoteSnapshot[]
+  bookingIntent  BookingIntent?
+  job            Job?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+// First-touch attribution, moved from browser localStorage into the
+// durable lead. One row per lead; never overwritten once created (spec
+// section 28) — the API only creates this on first write, subsequent
+// calls are no-ops for this table.
+model LeadAttribution {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String @unique
+
+  utmSource    String?
+  utmMedium    String?
+  utmCampaign  String?
+  utmContent   String?
+  utmTerm      String?
+  landingRoute String
+  referrer     String?
+  firstTouchAt DateTime
+
+  createdAt DateTime @default(now())
+}
+
+// One per lead (unique leadId) — a repeat contact submission for the same
+// lead updates this row rather than creating a duplicate (the natural
+// idempotency mechanism for this endpoint — see docs/SECURITY_MODEL.md).
+model ContactInfo {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String @unique
+
+  firstName String
+  email     String
+  phone     String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model TimingSelection {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String @unique
+
+  value TimingValue
+
+  createdAt DateTime @default(now())
+}
+
+// Configurable consent evidence (spec sections 14/15). Only the fields
+// that make sense for what's actually implemented in B2 are populated —
+// this is not a claim of legal completeness, see
+// docs/research/CANADA_COMMUNICATION_CONSENT.md.
+model ConsentEvidence {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String
+
+  category       ConsentCategory
+  purpose        String
+  channel        ConsentChannel
+  wordingVersion String
+  sourceRoute    String
+  sourceAction   String
+  jurisdiction   String          @default("CA-ON")
+
+  grantedAt   DateTime  @default(now())
+  withdrawnAt DateTime?
+
+  @@index([leadId])
+}
+
+// Immutable snapshot of the price the customer actually saw. Never
+// recalculated later from changed pricing rules (spec section 5) — a lead
+// may accumulate more than one snapshot if they revisit pricing, but each
+// row is frozen once written. The booking intent references exactly one.
+model QuoteSnapshot {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String
+
+  serviceSlug       String
+  serviceName       String
+  totalAreaM2       Decimal           @db.Decimal(6, 2)
+  materialOwnership MaterialOwnership
+  currency          String            @default("CAD")
+
+  // Integer minor units (cents) — never floats. See docs/SECURITY_MODEL.md.
+  subtotalMinor Int
+  taxMinor      Int
+  taxLabel      String
+  totalMinor    Int
+
+  pricingSource    PricingSourceType
+  priceGeneratedAt DateTime // client-reported generation time
+  bookingIntent    BookingIntent?
+
+  // Session E — nullable: only set when pricingSource is
+  // AUTHORITATIVE_VERSIONED. Never repointed after creation (spec
+  // section 11/33) — a snapshot's pricing version is part of its
+  // immutable history.
+  pricingVersion    PricingVersion?    @relation(fields: [pricingVersionId], references: [id])
+  pricingVersionId  String?
+  economicsSnapshot EconomicsSnapshot?
+
+  // Session G
+  payments Payment[]
+
+  createdAt DateTime @default(now())
+
+  @@index([leadId])
+  @@index([pricingVersionId])
+}
+
+// The final B2 action. At most one per lead (unique leadId) — this is
+// what makes booking-intent creation idempotent: a retried/duplicated
+// request for the same lead resolves to the same row instead of creating
+// a second one (spec sections 10/22).
+model BookingIntent {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String @unique
+
+  quoteSnapshot   QuoteSnapshot @relation(fields: [quoteSnapshotId], references: [id])
+  quoteSnapshotId String        @unique
+
+  status String @default("CREATED")
+
+  createdAt DateTime @default(now())
+
+  job Job?
+}
+
+// =============================================================================
+// Session D — Lean Admin Core (see docs/DECISIONS.md D022/D023,
+// docs/ADMIN_OPERATIONS.md). Owner-operated admin surface for the first
+// 1–4 professionals and first ~10–50 real Toronto jobs. Deliberately NOT
+// the full future marketplace schema (no payments, matching, messaging,
+// disputes, professional self-service) — those arrive in later phases.
+// =============================================================================
+
+// Future roles are named now so a later RBAC pass doesn't need to rename
+// anything (spec section 11) — but Session D only ever creates/authorizes
+// SUPER_ADMIN and enforces no per-role permission differences yet. See D022.
+enum AdminRole {
+  SUPER_ADMIN
+  OPERATIONS
+  CUSTOMER_SUPPORT
+  PRO_VERIFICATION
+  FINANCE
+  MARKETING
+  CONTENT
+  READ_ONLY
+}
+
+// The owner/operator account(s). Session D expects exactly one row,
+// created by `scripts/admin-bootstrap.mjs` — never seeded with a default
+// password (D022).
+model AdminUser {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String // scrypt, salted — see src/lib/server/password.ts. Never plaintext.
+  role         AdminRole @default(SUPER_ADMIN)
+  active       Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions        AdminSession[]
+  auditEvents     AuditEvent[]
+  notes           AdminNote[]
+  pricingVersions PricingVersion[]
+
+  // Session F
+  professionalActivationTokens ProfessionalActivationToken[]
+  jobOffersCreated             JobOffer[]
+
+  // Session G
+  refundsRequested             Refund[]
+  payoutsRecorded               Payout[]
+  completionConfirmationTokens CompletionConfirmationToken[]
+
+  // Session H
+  jobActualsRecorded JobActuals[]
+}
+
+// DB-backed session, not a JWT (D022): only a SHA-256 hash of the session
+// token is stored, so a database read alone can never yield a usable
+// session cookie, and logout/expiry are immediate (no blocklist needed).
+model AdminSession {
+  id          String    @id @default(cuid())
+  tokenHash   String    @unique
+  adminUser   AdminUser @relation(fields: [adminUserId], references: [id])
+  adminUserId String
+  createdAt   DateTime  @default(now())
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  lastSeenAt  DateTime  @default(now())
+  ipAddress   String?
+  userAgent   String?
+
+  @@index([adminUserId])
+  @@index([expiresAt])
+}
+
+enum ProfessionalVerificationStatus {
+  MISSING
+  SUBMITTED
+  UNDER_REVIEW
+  VERIFIED
+  REJECTED
+  EXPIRED
+  SUSPENDED
+}
+
+// Minimum professional record needed for manual assignment (spec section
+// 29). Admin-managed only — no professional self-registration/login yet.
+model Professional {
+  id                 String                         @id @default(cuid())
+  displayName        String
+  businessName       String?
+  email              String
+  phone              String
+  active             Boolean                        @default(true)
+  verificationStatus ProfessionalVerificationStatus  @default(MISSING)
+  // Plain descriptive text, not a geo model — Servino serves exactly one
+  // city today, so a structured service-area system would be speculative
+  // (spec section 29's own instruction not to overbuild this).
+  serviceAreaNote    String?
+  notes              String?
+
+  // Session F — nullable: a professional created by Admin has no
+  // password until they complete activation (D033). scrypt, salted —
+  // see src/lib/server/pro-auth.ts. Never plaintext.
+  passwordHash String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  services          ProfessionalService[]
+  jobs              Job[]
+  sessions          ProfessionalSession[]
+  activationTokens  ProfessionalActivationToken[]
+  offers            JobOffer[]
+  problemReports    ProblemReport[]
+  auditEvents       AuditEvent[]
+  payouts           Payout[] // Session G
+
+  @@index([active])
+}
+
+// Which of the static services-data.ts slugs this professional can take —
+// deliberately a string slug, not a Service FK, matching the existing
+// pattern where the quote funnel itself validates against
+// src/lib/services-data.ts rather than the DB Service table (D004).
+model ProfessionalService {
+  id             String       @id @default(cuid())
+  professional   Professional @relation(fields: [professionalId], references: [id])
+  professionalId String
+  serviceSlug    String
+  createdAt      DateTime     @default(now())
+
+  @@unique([professionalId, serviceSlug])
+  @@index([serviceSlug])
+}
+
+// Deliberately omits SCHEDULED from the spec's suggested lifecycle (D023)
+// — nothing in Session D captures an actual scheduled date, and a status
+// implying one without the data behind it would be dishonest UI.
+//
+// Session F (D034) adds OFFERED/EN_ROUTE/ARRIVED and clarifies existing
+// semantics: ASSIGNED now means "professional has accepted the offer";
+// IN_PROGRESS means "professional started on-site work"; COMPLETED means
+// professional-REPORTED completion only — not paid, not payout-sent, not
+// customer-confirmed (no payment phase exists yet). See
+// docs/WORKFLOWS.md "Session F" and src/lib/server/job-status.ts for the
+// authoritative transition table.
+// Session G adds CONFIRMED — customer (or admin-override) confirmation
+// of completion, distinct from COMPLETED (professional-reported) and
+// distinct again from payout eligibility, which is a separate computed
+// fact, not a status (D043). See docs/DECISIONS.md D043/D044 and
+// docs/WORKFLOWS.md "Session G".
+enum JobStatus {
+  NEW
+  REVIEWING
+  READY_FOR_ASSIGNMENT
+  OFFERED
+  ASSIGNED
+  EN_ROUTE
+  ARRIVED
+  IN_PROGRESS
+  COMPLETED
+  CONFIRMED
+  CANCELLED
+  DISPUTED
+  MANUAL_REVIEW
+}
+
+// The operational entity the admin actually works (spec section 23).
+// References Lead/BookingIntent rather than duplicating quote data — the
+// authoritative quote numbers always come from QuoteSnapshot via
+// BookingIntent, never copied onto Job (D023, spec section 54). Created
+// automatically alongside BookingIntent (see /api/lead/booking-intent) —
+// every submitted project request becomes an operable Job with no extra
+// manual "convert" step.
+model Job {
+  id     String @id @default(cuid())
+  lead   Lead   @relation(fields: [leadId], references: [id])
+  leadId String @unique
+
+  bookingIntent   BookingIntent @relation(fields: [bookingIntentId], references: [id])
+  bookingIntentId String        @unique
+
+  status JobStatus @default(NEW)
+
+  assignedProfessional   Professional? @relation(fields: [assignedProfessionalId], references: [id])
+  assignedProfessionalId String?
+  assignedAt              DateTime?
+
+  // Session F
+  offers         JobOffer[]
+  problemReports ProblemReport[]
+
+  // Session G
+  payment                      Payment?
+  payout                       Payout?
+  customerIssueReports         CustomerIssueReport[]
+  completionConfirmationTokens CompletionConfirmationToken[]
+
+  // Session H
+  jobActuals JobActuals?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([assignedProfessionalId])
+}
+
+// Generic audit action set (spec section 38) — one table instead of a
+// separate assignment-history table, since every action Session D needs
+// to trace (assignment, reassignment, status change, professional edits,
+// admin login) fits the same actor/entity/metadata shape (D022).
+enum AuditAction {
+  ADMIN_LOGIN_SUCCESS
+  ADMIN_LOGIN_FAILED
+  ADMIN_LOGOUT
+  PROFESSIONAL_CREATED
+  PROFESSIONAL_UPDATED
+  JOB_CREATED
+  JOB_STATUS_CHANGED
+  JOB_ASSIGNED
+  JOB_REASSIGNED
+  PRICING_VERSION_CREATED
+  PRICING_VERSION_ACTIVATED
+  PRICING_VERSION_RETIRED
+  // Session F
+  PROFESSIONAL_ACTIVATION_CREATED
+  PROFESSIONAL_ACTIVATED
+  PROFESSIONAL_LOGIN_SUCCESS
+  PROFESSIONAL_LOGIN_FAILED
+  PROFESSIONAL_LOGOUT
+  JOB_OFFERED
+  JOB_OFFER_WITHDRAWN
+  JOB_OFFER_ACCEPTED
+  JOB_OFFER_DECLINED
+  JOB_EN_ROUTE
+  JOB_ARRIVED
+  JOB_STARTED
+  JOB_COMPLETION_REPORTED
+  JOB_PROBLEM_REPORTED
+  // Session G — actorId/actorProfessionalId both null for customer-
+  // initiated events (the customer funnel has no persistent account to
+  // reference, same precedent as system-initiated JOB_CREATED, D032).
+  PAYMENT_ORDER_CREATED
+  PAYMENT_CAPTURED
+  PAYMENT_FAILED
+  PAYMENT_RECONCILED
+  REFUND_INITIATED
+  REFUND_COMPLETED
+  COMPLETION_TOKEN_CREATED
+  CUSTOMER_COMPLETION_CONFIRMED
+  CUSTOMER_ISSUE_REPORTED
+  ADMIN_COMPLETION_CONFIRMED
+  PAYOUT_ELIGIBLE
+  PAYOUT_RECORDED
+  PAYOUT_HELD
+  // Session H
+  JOB_ACTUALS_RECORDED
+}
+
+model AuditEvent {
+  id         String      @id @default(cuid())
+  action     AuditAction
+  entityType String // "JOB" | "PROFESSIONAL" | "ADMIN_USER" | "ADMIN_LOGIN" | "PROFESSIONAL_LOGIN"
+  entityId   String
+  actor      AdminUser?  @relation(fields: [actorId], references: [id])
+  actorId    String? // null for system-initiated events (e.g. JOB_CREATED from a customer booking intent)
+
+  // Session F — a second, independent actor slot for professional-
+  // initiated events (job accepted/declined/en-route/etc.). Never both
+  // set on the same row; kept as two separate nullable FKs rather than a
+  // single polymorphic actor field so each stays a real, enforced
+  // foreign key (D032).
+  actorProfessional   Professional? @relation(fields: [actorProfessionalId], references: [id])
+  actorProfessionalId String?
+
+  // Safe, structured fields only (e.g. {"from":"NEW","to":"REVIEWING"}) —
+  // never passwords/secrets/full contact PII (spec section 38).
+  metadata   Json?
+  createdAt  DateTime    @default(now())
+
+  @@index([entityType, entityId])
+  @@index([createdAt])
+}
+
+// Small internal note capability (spec section 56) — admin-only,
+// timestamped, actor-recorded, plain text (no HTML rendering anywhere it's
+// displayed), never shown to customers.
+model AdminNote {
+  id         String    @id @default(cuid())
+  entityType String // "JOB" | "PROFESSIONAL"
+  entityId   String
+  body       String
+  author     AdminUser @relation(fields: [authorId], references: [id])
+  authorId   String
+  createdAt  DateTime  @default(now())
+
+  @@index([entityType, entityId])
+}
+
+// =============================================================================
+// Session E — Toronto Pricing + Unit Economics (see docs/PRICING_MODEL.md,
+// docs/UNIT_ECONOMICS.md, docs/DECISIONS.md D026–D029).
+//
+// A PricingVersion is the smallest unit that can be "the current Toronto
+// price list" — it bundles the customer-facing rate rules (ServicePricingRule)
+// with the internal economics assumptions used to estimate Servino's
+// contribution profit on each quote, because both must change together to
+// stay meaningful as a single, traceable configuration. At most one
+// PricingVersion may be ACTIVE per citySlug at a time — enforced by a
+// partial unique index added by raw SQL in this phase's migration, not by
+// application logic alone (see migration.sql).
+// =============================================================================
+
+enum PricingVersionStatus {
+  DRAFT
+  ACTIVE
+  RETIRED
+}
+
+model PricingVersion {
+  id       String               @id @default(cuid())
+  citySlug String // "toronto" — one authoritative market today (spec section 13)
+  label    String // human name, e.g. "Toronto Launch v1"
+  status   PricingVersionStatus @default(DRAFT)
+  currency String               @default("CAD")
+
+  // Tax — one jurisdiction (Ontario) for now, so kept inline rather than a
+  // separate versioned table; revisit if/when a second province launches.
+  taxRatePercent Decimal @db.Decimal(5, 2) // e.g. 13.00
+  taxLabel       String // "HST (13%)"
+
+  // Internal unit-economics assumptions, versioned alongside the customer
+  // rates that produced them (spec sections 26/34) — never applied
+  // retroactively to a historical EconomicsSnapshot.
+  professionalPayoutPercentOfLabor  Decimal @db.Decimal(5, 2) // % of the LABOR component paid to the professional
+  materialCostPercentOfCustomerRate Decimal @db.Decimal(5, 2) // Servino's estimated material cost, as % of the customer material rate
+  paymentProcessingPercent          Decimal @db.Decimal(5, 2)
+  paymentProcessingFixedMinor       Int
+  estimatedCacMinor                 Int
+  otherVariableCostMinor            Int
+  healthyMarginPercent              Decimal @db.Decimal(5, 2) // contribution margin >= this → HEALTHY
+  acceptableMarginPercent           Decimal @db.Decimal(5, 2) // >= this → ACCEPTABLE
+  lowMarginPercent                  Decimal @db.Decimal(5, 2) // >= this → LOW_MARGIN; below → UNPROFITABLE
+
+  rules              ServicePricingRule[]
+  quoteSnapshots     QuoteSnapshot[]
+  economicsSnapshots EconomicsSnapshot[]
+
+  createdByAdmin   AdminUser? @relation(fields: [createdByAdminId], references: [id])
+  createdByAdminId String?
+
+  effectiveAt DateTime?
+  activatedAt DateTime?
+  retiredAt   DateTime?
+  notes       String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([citySlug, status])
+}
+
+// One row per service per pricing version — deliberately a flat per-m² rate
+// pair (install-only, material) rather than the full future pricing-model
+// taxonomy (PER_AREA/FIXED/HOURLY/etc. — spec section 8): that's what the
+// Toronto wall-finishing launch niche actually needs. The `PublicPricingMode`
+// enum on `Service` (Phase A) already exists for when a future service needs
+// STARTING_FROM/RANGE/QUOTE_ONLY instead of exact pricing.
+model ServicePricingRule {
+  id               String         @id @default(cuid())
+  pricingVersion   PricingVersion @relation(fields: [pricingVersionId], references: [id])
+  pricingVersionId String
+  serviceSlug      String
+
+  installOnlyRateMinorPerM2 Int
+  materialRateMinorPerM2    Int
+  minimumSubtotalMinor      Int
+
+  createdAt DateTime @default(now())
+
+  @@unique([pricingVersionId, serviceSlug])
+}
+
+enum QuoteHealth {
+  HEALTHY
+  ACCEPTABLE
+  LOW_MARGIN
+  UNPROFITABLE
+}
+
+// Immutable internal economics snapshot, paired 1:1 with the customer-facing
+// QuoteSnapshot it was computed alongside (spec section 34) — never
+// recomputed using a later pricing version's assumptions. Never exposed to
+// the customer (spec section 32) — only surfaced in /admin.
+model EconomicsSnapshot {
+  id               String         @id @default(cuid())
+  quoteSnapshot    QuoteSnapshot  @relation(fields: [quoteSnapshotId], references: [id])
+  quoteSnapshotId  String         @unique
+  pricingVersion   PricingVersion @relation(fields: [pricingVersionId], references: [id])
+  pricingVersionId String
+
+  // All integer minor units (cents) — see docs/SECURITY_MODEL.md.
+  professionalPayoutEstimateMinor Int
+  materialCostEstimateMinor       Int
+  processingEstimateMinor         Int
+  cacAssumptionMinor              Int
+  discountMinor                   Int @default(0) // no discount codes exist yet — always 0 today
+  referralCostMinor               Int @default(0) // no referral program exists yet — always 0 today
+  otherVariableCostMinor          Int
+  contributionProfitMinor         Int // may be negative — that's the point of the health flag below
+
+  contributionMarginPercent Decimal     @db.Decimal(6, 2)
+  quoteHealth               QuoteHealth
+
+  createdAt DateTime @default(now())
+
+  @@index([pricingVersionId])
+}
+
+// =============================================================================
+// Session F — Minimal Professional Job App (see docs/DECISIONS.md D032–D038,
+// docs/WORKFLOWS.md "Session F", docs/PROFESSIONAL_OPERATIONS.md).
+//
+// Adds real professional authentication (fully separate boundary from
+// AdminUser — D032), a secure admin-issued activation flow (D033), an
+// explicit JobOffer concept preserving full offer history rather than
+// overwriting who-was-offered-what (spec sections 63/64), and the field
+// workflow (en route/arrived/start/complete) plus lightweight problem
+// reporting. Deliberately NOT a full marketplace: no payments, no payouts,
+// no matching algorithm, no professional self-registration.
+// =============================================================================
+
+// DB-backed session, same shape/reasoning as AdminSession (D024) but a
+// fully independent table/cookie (D032) — an admin session must never be
+// usable to authenticate as a professional, or vice versa.
+model ProfessionalSession {
+  id             String       @id @default(cuid())
+  tokenHash      String       @unique
+  professional   Professional @relation(fields: [professionalId], references: [id])
+  professionalId String
+  createdAt      DateTime     @default(now())
+  expiresAt      DateTime
+  revokedAt      DateTime?
+  lastSeenAt     DateTime     @default(now())
+  ipAddress      String?
+  userAgent      String?
+
+  @@index([professionalId])
+  @@index([expiresAt])
+}
+
+// One-time, admin-issued account setup token (D033). Only the SHA-256
+// hash is ever persisted — the raw token exists only in the single API
+// response that creates it, never logged, never stored in AuditEvent
+// metadata. `usedAt` makes reuse structurally impossible once consumed
+// (checked via a conditional update, not just an application-level `if`).
+model ProfessionalActivationToken {
+  id             String       @id @default(cuid())
+  tokenHash      String       @unique
+  professional   Professional @relation(fields: [professionalId], references: [id])
+  professionalId String
+  createdAt      DateTime     @default(now())
+  expiresAt      DateTime
+  usedAt         DateTime?
+
+  createdByAdmin   AdminUser? @relation(fields: [createdByAdminId], references: [id])
+  createdByAdminId String?
+
+  @@index([professionalId])
+}
+
+enum JobOfferStatus {
+  OFFERED
+  ACCEPTED
+  DECLINED
+  WITHDRAWN
+}
+
+enum DeclineReasonCode {
+  UNAVAILABLE
+  TIMING
+  OUTSIDE_AREA
+  NOT_SUITABLE
+  OTHER
+}
+
+// One row per offer INSTANCE, not per job (D035/D037) — a job that was
+// offered to A (declined), then B (accepted) has two JobOffer rows,
+// preserving full history rather than overwriting A out of existence
+// (spec section 64). At most one row per job may be in status OFFERED at
+// a time — enforced by a partial unique index added by raw SQL in this
+// phase's migration (same pattern as PricingVersion's D027), not by
+// application logic alone; this is also what makes the
+// accept-vs-admin-withdraw race safe (spec section 53).
+model JobOffer {
+  id     String @id @default(cuid())
+  job    Job    @relation(fields: [jobId], references: [id])
+  jobId  String
+
+  professional   Professional @relation(fields: [professionalId], references: [id])
+  professionalId String
+
+  // Integer minor units (cents) — never a float. Independent from
+  // EconomicsSnapshot.professionalPayoutEstimateMinor (D038) — an
+  // admin-entered actual offer, not auto-filled from the estimate.
+  offerAmountMinor Int
+  status           JobOfferStatus @default(OFFERED)
+
+  declineReason DeclineReasonCode?
+  declineNote   String?
+
+  offeredAt   DateTime  @default(now())
+  respondedAt DateTime?
+
+  offeredByAdmin   AdminUser? @relation(fields: [offeredByAdminId], references: [id])
+  offeredByAdminId String?
+
+  createdAt DateTime @default(now())
+
+  payout Payout? // Session G — set only if this offer was the one accepted and later became payout-eligible
+
+  @@index([jobId])
+  @@index([professionalId])
+}
+
+enum ProblemReasonCode {
+  CUSTOMER_UNAVAILABLE
+  ACCESS_PROBLEM
+  MATERIAL_PROBLEM
+  SCOPE_DIFFERS
+  SAFETY_CONCERN
+  CANNOT_COMPLETE
+  OTHER
+}
+
+// A flag for Admin attention, not a JobStatus transition (D036) — the job
+// stays in whatever status it was actually in when the problem was
+// reported; Admin decides whether/how to change the job's status.
+model ProblemReport {
+  id     String @id @default(cuid())
+  job    Job    @relation(fields: [jobId], references: [id])
+  jobId  String
+
+  professional   Professional @relation(fields: [professionalId], references: [id])
+  professionalId String
+
+  reasonCode ProblemReasonCode
+  note       String?
+
+  reportedAt DateTime  @default(now())
+  resolved   Boolean   @default(false)
+  resolvedAt DateTime?
+
+  @@index([jobId])
+}
+
+// =============================================================================
+// Session G — Customer Payments + Completion Confirmation + Payout
+// Foundation (see docs/DECISIONS.md D039–D044, docs/PAYMENTS.md,
+// docs/PAYOUTS.md, docs/research/PAYPAL_MARKETPLACE_FEASIBILITY.md).
+//
+// Mode B (D039): customers pay Servino directly via standard (non-
+// marketplace) PayPal Checkout — verified available in Canada with no
+// special approval. Professional payout is tracked internally and paid
+// manually by Admin outside PayPal, then recorded here. Automated
+// marketplace/Payouts-API disbursement (Mode A) was NOT implemented —
+// research found it requires PayPal partner/business approval this
+// session had no way to verify Servino holds.
+// =============================================================================
+
+// Maps PayPal's actual Orders API + webhook-event vocabulary, not a
+// generic invented state machine (spec section 11). CAPTURED is the
+// only state professional offers are allowed to be offered against
+// (D044). PARTIALLY_REFUNDED and DISPUTED exist for schema completeness
+// (a PayPal-side event could report either) even though Session G's own
+// refund endpoint only ever issues full refunds (spec section 50).
+enum PaymentStatus {
+  PENDING
+  CREATED
+  APPROVED
+  CAPTURED
+  FAILED
+  CANCELLED
+  REFUNDED
+  PARTIALLY_REFUNDED
+  DISPUTED
+}
+
+// One row per Job (jobId unique) — the CURRENT state of that job's
+// payment, mutable in place (same pattern as Job.status itself);
+// immutable history lives in PaymentEvent, not in multiple Payment rows
+// (D041 — no separate PaymentAttempt table).
+model Payment {
+  id    String @id @default(cuid())
+  job   Job    @relation(fields: [jobId], references: [id])
+  jobId String @unique
+
+  // What this payment is actually for — spec section 15's "Payment
+  // references the quote/job financial snapshot used for collection."
+  quoteSnapshot   QuoteSnapshot @relation(fields: [quoteSnapshotId], references: [id])
+  quoteSnapshotId String
+
+  status   PaymentStatus @default(PENDING)
+  currency String        @default("CAD")
+  // Integer minor units, frozen from quoteSnapshot.totalMinor at
+  // creation (D040) — never recomputed from a live quote afterward.
+  amountMinor Int
+
+  // Provider-portable field name even though only PayPal exists today
+  // (spec section 6/7 — architecture stays portable, no second
+  // provider implemented this session).
+  provider String @default("PAYPAL")
+
+  paypalOrderId   String? @unique
+  paypalCaptureId String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  events  PaymentEvent[]
+  refunds Refund[]
+
+  @@index([status])
+}
+
+enum PaymentEventSource {
+  API
+  WEBHOOK
+}
+
+// Append-only — never updated, never deleted. The actual webhook-
+// idempotency mechanism: providerEventId is globally unique (not
+// scoped per-payment, matching PayPal's own event-ID uniqueness), so
+// the same webhook delivered 1, 10, or 100 times can only ever insert
+// one row (spec sections 21/22) — enforced by the database, not just
+// application logic (same precedent as D027/D035's partial unique
+// indexes).
+model PaymentEvent {
+  id        String  @id @default(cuid())
+  payment   Payment @relation(fields: [paymentId], references: [id])
+  paymentId String
+
+  source PaymentEventSource
+
+  // Raw provider event type string (e.g. "PAYMENT.CAPTURE.COMPLETED")
+  // or a synthetic label for direct API-response-derived events (e.g.
+  // "orders.capture") — kept as a string, not an enum, since PayPal's
+  // own event catalogue is large and mapping every possible value into
+  // a closed Prisma enum would be exactly the "invented precision"
+  // spec section 11 warns against.
+  eventType       String
+  providerEventId String? @unique
+  resultingStatus PaymentStatus
+
+  // Minimized/redacted provider payload — never raw card data, never
+  // secrets (spec section 75/76). Only the fields this app actually
+  // reads are stored.
+  summary Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([paymentId])
+}
+
+enum RefundStatus {
+  PENDING
+  COMPLETED
+  FAILED
+}
+
+// One row per refund attempt — a Payment can accumulate more than one
+// over time (even though Session G's own UI only offers a single full
+// refund), so this is additive-safe for a future partial-refund UI
+// without a schema change.
+model Refund {
+  id        String  @id @default(cuid())
+  payment   Payment @relation(fields: [paymentId], references: [id])
+  paymentId String
+
+  amountMinor Int
+  status      RefundStatus @default(PENDING)
+  reason      String?
+
+  paypalRefundId String? @unique
+
+  requestedByAdmin   AdminUser @relation(fields: [requestedByAdminId], references: [id])
+  requestedByAdminId String
+
+  createdAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  @@index([paymentId])
+}
+
+// NOT_ELIGIBLE is deliberately absent — it is represented by the
+// absence of a Payout row for a job, not a stored value (D043).
+// PROCESSING/FAILED (spec section 12's suggested states) are also
+// absent — Mode B's manual workflow has no intermediate "processing"
+// step and no failure mode for recording something that already
+// happened outside the system; both become real states only if/when
+// Mode A (automated payout) is ever implemented.
+enum PayoutStatus {
+  ELIGIBLE
+  PAID
+  HELD
+  CANCELLED
+}
+
+// One row per Job (jobId unique), materialized only once eligibility
+// is first computed true (D043) — never pre-created speculatively.
+model Payout {
+  id    String @id @default(cuid())
+  job   Job    @relation(fields: [jobId], references: [id])
+  jobId String @unique
+
+  professional   Professional @relation(fields: [professionalId], references: [id])
+  professionalId String
+
+  // The amount authority (D042) — the ACCEPTED offer, not the Session E
+  // estimate, not a live re-query. amountMinor below is a frozen copy
+  // of this offer's amount at the moment this Payout row was created;
+  // jobOffer itself is never mutated, so "what was agreed" is always
+  // separately readable even if amountMinor is later overridden.
+  jobOffer   JobOffer @relation(fields: [jobOfferId], references: [id])
+  jobOfferId String   @unique
+
+  amountMinor Int
+  status      PayoutStatus @default(ELIGIBLE)
+
+  eligibleAt DateTime @default(now())
+
+  // Manual (Mode B) recording fields — populated only once Admin
+  // actually records the payout as paid.
+  methodCategory String? // e.g. "E_TRANSFER" | "CASH" | "CHEQUE" | "OTHER" — free text, admin-entered
+  externalReference String?
+  paidAt             DateTime?
+  note               String?
+  amountOverrideReason String? // required (enforced in application code) whenever amountMinor != jobOffer.offerAmountMinor
+
+  heldReason String? // set when transitioned to HELD (e.g. a customer issue report)
+
+  recordedByAdmin   AdminUser? @relation(fields: [recordedByAdminId], references: [id])
+  recordedByAdminId String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([professionalId])
+}
+
+enum CustomerIssueReasonCode {
+  INCOMPLETE
+  QUALITY
+  DAMAGE
+  SCOPE
+  OTHER
+}
+
+// A flag, same philosophy as Session F's ProblemReport (D036) — does
+// NOT transition Job.status by itself (the job simply never reaches
+// CONFIRMED while an unresolved issue exists) and does NOT trigger any
+// automatic refund or payout change (spec section 39).
+model CustomerIssueReport {
+  id    String @id @default(cuid())
+  job   Job    @relation(fields: [jobId], references: [id])
+  jobId String
+
+  reasonCode CustomerIssueReasonCode
+  note       String?
+
+  reportedAt DateTime  @default(now())
+  resolved   Boolean   @default(false)
+  resolvedAt DateTime?
+
+  @@index([jobId])
+}
+
+// One-time, admin-issued (same shape/reasoning as Session F's
+// ProfessionalActivationToken, D033) — lets a customer with no
+// persistent Servino account confirm completion or report an issue
+// days/weeks after their original anonymous funnel session, without
+// needing email/notification infrastructure this project has
+// consistently deferred. Only the SHA-256 hash is ever persisted.
+model CompletionConfirmationToken {
+  id        String @id @default(cuid())
+  tokenHash String @unique
+  job       Job    @relation(fields: [jobId], references: [id])
+  jobId     String
+
+  expiresAt DateTime
+  usedAt    DateTime?
+
+  createdByAdmin   AdminUser @relation(fields: [createdByAdminId], references: [id])
+  createdByAdminId String
+
+  createdAt DateTime @default(now())
+
+  @@index([jobId])
+}
+
+// =============================================================================
+// Session H — First-10-Jobs actual economics (see docs/DECISIONS.md,
+// docs/UNIT_ECONOMICS.md "Session H"). Separate from Session E's
+// EconomicsSnapshot (an immutable, quote-time ESTIMATE) — this table is
+// what Admin observed actually happened, entered after the fact. Never
+// overwrites EconomicsSnapshot; the two sit side by side so /admin/launch
+// can compare estimate vs actual per job (spec sections 38–40/44–46).
+// =============================================================================
+
+// One row per Job (jobId unique). `actualMaterialCostMinor` and
+// `actualCacMinor` are nullable with NO default — an untouched field
+// means UNKNOWN, never a silent $0 (spec section 46). Only
+// `actualOtherVariableCostMinor` is treated as 0 when absent in the
+// actual-contribution computation (src/lib/admin/launch-economics.ts)
+// — a deliberate, documented, single exception: it's the
+// least-often-applicable line item, and most jobs genuinely have none.
+model JobActuals {
+  id    String @id @default(cuid())
+  job   Job    @relation(fields: [jobId], references: [id])
+  jobId String @unique
+
+  actualMaterialCostMinor      Int?
+  actualCacMinor                Int?
+  actualOtherVariableCostMinor Int?
+  note                          String?
+
+  recordedByAdmin   AdminUser @relation(fields: [recordedByAdminId], references: [id])
+  recordedByAdminId String
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([jobId])
+}
